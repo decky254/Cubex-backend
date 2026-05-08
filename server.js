@@ -6,18 +6,11 @@ import { createClient } from "@supabase/supabase-js";
 dotenv.config();
 
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
 /**
- * Debug ENV (helps confirm Render is working)
- */
-console.log("SUPABASE_URL LOADED:", !!process.env.SUPABASE_URL);
-console.log("SUPABASE_SERVICE_ROLE_KEY LOADED:", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
-
-/**
- * Supabase Client
+ * ENV CHECK
  */
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -28,29 +21,199 @@ if (!supabaseKey) throw new Error("SUPABASE_SERVICE_ROLE_KEY is required.");
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 /**
- * TEST ROUTE
+ * =========================
+ * WALLET AUTO CREATION
+ * =========================
  */
-app.get("/", (req, res) => {
-  res.send("CubeX Backend Running 🚀");
-});
-
-/**
- * GET WALLET
- */
-app.get("/api/wallet/:user_id", async (req, res) => {
+async function ensureWallet(user_id) {
   const { data, error } = await supabase
     .from("wallets")
     .select("*")
-    .eq("user_id", req.params.user_id)
-    .single();
+    .eq("user_id", user_id)
+    .maybeSingle();
 
-  if (error) return res.status(400).json(error);
+  if (error) throw error;
 
-  res.json(data);
+  if (!data) {
+    const { data: newWallet, error: createError } = await supabase
+      .from("wallets")
+      .insert([{ user_id, balance: 0 }])
+      .select()
+      .single();
+
+    if (createError) throw createError;
+    return newWallet;
+  }
+
+  return data;
+}
+
+/**
+ * =========================
+ * PRICE FEED (BTC TEST)
+ * =========================
+ */
+async function getPrice() {
+  const res = await fetch(
+    "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+  );
+  const data = await res.json();
+  return Number(data.price);
+}
+
+/**
+ * =========================
+ * PNL CALCULATION
+ * =========================
+ */
+function calculatePnL(trade, price) {
+  if (trade.direction === "buy") {
+    return (price - trade.entry_price) * trade.units;
+  } else {
+    return (trade.entry_price - price) * trade.units;
+  }
+}
+
+/**
+ * =========================
+ * LIVE PNL ENGINE
+ * =========================
+ */
+async function updatePnL() {
+  const price = await getPrice();
+
+  const { data: trades } = await supabase
+    .from("trades")
+    .select("*")
+    .eq("status", "open");
+
+  if (!trades) return;
+
+  for (let trade of trades) {
+    const pnl = calculatePnL(trade, price);
+
+    await supabase
+      .from("trades")
+      .update({ pnl })
+      .eq("id", trade.id);
+  }
+}
+
+/**
+ * =========================
+ * AUTO UNLOCK ENGINE
+ * =========================
+ */
+async function unlockTrades() {
+  const now = new Date();
+
+  const { data: trades } = await supabase
+    .from("trades")
+    .select("*")
+    .eq("is_locked", true);
+
+  if (!trades) return;
+
+  for (let trade of trades) {
+    if (new Date(trade.lock_expires_at) <= now) {
+      await supabase
+        .from("trades")
+        .update({ is_locked: false })
+        .eq("id", trade.id);
+    }
+  }
+}
+
+/**
+ * =========================
+ * ROUTES
+ * =========================
+ */
+
+app.get("/", (req, res) => {
+  res.send("🚀 CubeX Trading Engine Running");
 });
 
 /**
- * GET TRADES
+ * WALLET
+ */
+app.get("/api/wallet/:user_id", async (req, res) => {
+  try {
+    const wallet = await ensureWallet(req.params.user_id);
+    res.json(wallet);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * TRADE WITH LOCK + TP/SL
+ */
+app.post("/api/trade", async (req, res) => {
+  const {
+    user_id,
+    pair,
+    amount,
+    direction,
+    units,
+    take_profit,
+    stop_loss,
+    lock_duration_days
+  } = req.body;
+
+  try {
+    const wallet = await ensureWallet(user_id);
+
+    if (Number(wallet.balance) < Number(amount)) {
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
+    const newBalance = Number(wallet.balance) - Number(amount);
+
+    await supabase
+      .from("wallets")
+      .update({ balance: newBalance })
+      .eq("user_id", user_id);
+
+    const expiry = new Date();
+    expiry.setDate(expiry.getDate() + Number(lock_duration_days));
+
+    const { data, error } = await supabase
+      .from("trades")
+      .insert([
+        {
+          user_id,
+          pair,
+          amount,
+          direction,
+          units,
+          take_profit,
+          stop_loss,
+          lock_duration_days,
+          lock_expires_at: expiry.toISOString(),
+          is_locked: true,
+          entry_price: 0,
+          pnl: 0,
+          status: "open",
+          execution_type: "locked"
+        }
+      ])
+      .select();
+
+    if (error) return res.status(400).json(error);
+
+    res.json({
+      success: true,
+      wallet_balance: newBalance,
+      trade: data
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * TRADES
  */
 app.get("/api/trades/:user_id", async (req, res) => {
   const { data, error } = await supabase
@@ -59,114 +222,16 @@ app.get("/api/trades/:user_id", async (req, res) => {
     .eq("user_id", req.params.user_id);
 
   if (error) return res.status(400).json(error);
-
   res.json(data);
 });
 
 /**
- * PLACE TRADE (FIXED INSERT + WALLET SAFETY)
+ * =========================
+ * BACKGROUND LOOPS
+ * =========================
  */
-app.post("/api/trade", async (req, res) => {
-  const { user_id, pair, amount, direction } = req.body;
-
-  // GET WALLET
-  const { data: wallet, error: walletError } = await supabase
-    .from("wallets")
-    .select("*")
-    .eq("user_id", user_id)
-    .single();
-
-  if (walletError) return res.status(400).json(walletError);
-
-  if (!wallet || Number(wallet.balance) < Number(amount)) {
-    return res.status(400).json({
-      error: "Insufficient balance"
-    });
-  }
-
-  // UPDATE BALANCE (SAFE MATH)
-  const newBalance = Number(wallet.balance) - Number(amount);
-
-  const { error: updateError } = await supabase
-    .from("wallets")
-    .update({ balance: newBalance })
-    .eq("user_id", user_id);
-
-  if (updateError) return res.status(400).json(updateError);
-
-  // INSERT TRADE (FIXED .select())
-  const { data, error } = await supabase
-    .from("trades")
-    .insert([
-      {
-        user_id,
-        pair,
-        amount,
-        direction,
-        entry_price: 0,
-        pnl: 0,
-        status: "open",
-        execution_type: "instant"
-      }
-    ])
-    .select();
-
-  if (error) return res.status(400).json(error);
-
-  res.json({
-    success: true,
-    trade: data
-  });
-});
-
-/**
- * WITHHELD TRADE
- */
-app.post("/api/trade/withheld", async (req, res) => {
-  const { user_id, pair, amount, direction, trigger_price } = req.body;
-
-  const { data, error } = await supabase
-    .from("trades")
-    .insert([
-      {
-        user_id,
-        pair,
-        amount,
-        direction,
-        entry_price: 0,
-        pnl: 0,
-        status: "pending",
-        execution_type: "withheld",
-        trigger_price
-      }
-    ])
-    .select();
-
-  if (error) return res.status(400).json(error);
-
-  res.json({
-    success: true,
-    trade: data
-  });
-});
-
-/**
- * ADMIN BALANCE UPDATE
- */
-app.post("/api/admin/balance", async (req, res) => {
-  const { user_id, amount } = req.body;
-
-  const { error } = await supabase
-    .from("wallets")
-    .update({ balance: amount })
-    .eq("user_id", user_id);
-
-  if (error) return res.status(400).json(error);
-
-  res.json({
-    success: true
-  });
-});
+setInterval(updatePnL, 5000);      // live pnl
+setInterval(unlockTrades, 60000);  // unlock system
 
 /**
  * START SERVER
@@ -174,6 +239,5 @@ app.post("/api/admin/balance", async (req, res) => {
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, () => {
-  console.log(`CubeX backend running on port ${PORT} 🚀`);
+  console.log(`🚀 CubeX Engine running on port ${PORT}`);
 });
-
